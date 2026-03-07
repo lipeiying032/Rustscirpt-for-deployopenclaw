@@ -106,7 +106,7 @@ impl SyncManager {
             return Ok(());
         }
 
-        for path in entries {
+        for path in &entries {
             let content = self.download_file(&path).await?;
             let local_path = self.config.workspace_dir.join(&path);
             if let Some(parent) = local_path.parent() {
