@@ -65,6 +65,7 @@ echo "[start.sh] LiteLLM healthy after ${WAITED}s"
 
 # ── 5. Start OpenClaw pointing at LiteLLM proxy ───────────────────────────────
 exec env \
+    HOST=0.0.0.0 \
     OPENAI_API_KEY=litellm-proxy \
     OPENAI_BASE_URL=http://127.0.0.1:4000 \
     openclaw gateway --port 7860  --allow-unconfigured
