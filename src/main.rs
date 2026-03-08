@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -465,11 +463,16 @@ fn spawn_child_from_args() -> Result<Child> {
     command.spawn().context("failed to spawn child process")
 }
 
+/// Forward SIGTERM to the child process using libc::kill.
 fn forward_sigterm(child: &mut Child) {
     if let Some(id) = child.id() {
-        let pid = Pid::from_raw(id as i32);
-        if let Err(err) = signal::kill(pid, Signal::SIGTERM) {
-            eprintln!("failed to forward SIGTERM: {err}");
+        // SAFETY: id is a valid pid obtained from a live child process.
+        let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) };
+        if ret != 0 {
+            eprintln!(
+                "failed to forward SIGTERM: errno={}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -488,9 +491,13 @@ async fn wait_for_child_shutdown(child: &mut Child) {
                 FINAL_WAIT_TIMEOUT
             );
             if let Some(id) = child.id() {
-                let pid = Pid::from_raw(id as i32);
-                if let Err(err) = signal::kill(pid, Signal::SIGKILL) {
-                    eprintln!("failed to SIGKILL child: {err}");
+                // SAFETY: id is a valid pid obtained from a live child process.
+                let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGKILL) };
+                if ret != 0 {
+                    eprintln!(
+                        "failed to SIGKILL child: errno={}",
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
         }
