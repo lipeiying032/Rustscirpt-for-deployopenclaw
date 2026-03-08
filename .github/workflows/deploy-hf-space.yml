@@ -20,15 +20,73 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
         run: |
-          test -n "$HF_TOKEN" || (echo "Missing secret HF_TOKEN" && exit 1)
-          test -n "$HF_SPACE_ID" || (echo "Missing secret HF_SPACE_ID" && exit 1)
+          test -n "$HF_TOKEN"    || (echo "❌ Missing secret: HF_TOKEN"    && exit 1)
+          test -n "$HF_SPACE_ID" || (echo "❌ Missing secret: HF_SPACE_ID" && exit 1)
 
       - name: Push repository to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
         run: |
-          git config --global user.name "github-actions[bot]"
+          git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git remote add hf "https://oauth2:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE_ID}"
-          git push hf HEAD:main --force
+
+          # Push and retry once on transient failure
+          git push hf HEAD:main --force || (sleep 5 && git push hf HEAD:main --force)
+
+      - name: Wake up Space (resume if paused)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+        run: |
+          # Resume the space if it is paused/sleeping
+          RESUME_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "https://huggingface.co/api/spaces/${HF_SPACE_ID}/resume" \
+            -H "Authorization: Bearer ${HF_TOKEN}")
+          echo "Resume response: $RESUME_RESP"
+
+      - name: Trigger rebuild via HF Spaces API
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+        run: |
+          # Explicitly request a factory-reboot so HF always triggers a fresh build
+          RESTART_RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+            -X POST "https://huggingface.co/api/spaces/${HF_SPACE_ID}/restart?factory=true" \
+            -H "Authorization: Bearer ${HF_TOKEN}" \
+            -H "Content-Type: application/json")
+
+          HTTP_STATUS=$(echo "$RESTART_RESP" | grep "HTTP_STATUS" | cut -d: -f2)
+          BODY=$(echo "$RESTART_RESP" | grep -v "HTTP_STATUS")
+
+          echo "Restart response ($HTTP_STATUS): $BODY"
+
+          # 200 = restarted, 401/403 = token lacks write permission
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "⚠️  Restart API returned $HTTP_STATUS — build may still start from the git push alone."
+          fi
+
+      - name: Wait for build to start and report status
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+        run: |
+          echo "Waiting for Space build to start..."
+          sleep 10
+
+          STATUS_JSON=$(curl -s \
+            "https://huggingface.co/api/spaces/${HF_SPACE_ID}/runtime" \
+            -H "Authorization: Bearer ${HF_TOKEN}")
+
+          STAGE=$(echo "$STATUS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stage','unknown'))" 2>/dev/null || echo "unknown")
+          echo "Space stage: $STAGE"
+
+          case "$STAGE" in
+            BUILDING|RUNNING|RUNNING_BUILDING)
+              echo "✅ Build triggered successfully — stage: $STAGE" ;;
+            PAUSED|STOPPED|ERROR|RUNTIME_ERROR)
+              echo "⚠️  Unexpected stage: $STAGE — check the Space logs on HuggingFace." ;;
+            *)
+              echo "ℹ️  Stage: $STAGE" ;;
+          esac
