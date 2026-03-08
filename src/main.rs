@@ -14,13 +14,18 @@ use tokio::process::{Child, Command};
 use tokio::time::{interval, timeout};
 use walkdir::WalkDir;
 
-const WORKSPACE_DIR: &str = "/home/user/.openclaw/workspace";
+/// The OpenClaw config directory we sync to/from HuggingFace.
+/// Must match the path OpenClaw itself writes to (HOME=/home/node).
+const WORKSPACE_DIR: &str = "/home/node/.openclaw";
+
 const STATE_FILE: &str = ".hf-sync-state.json";
 const FINAL_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 struct Config {
     token: String,
+    /// HuggingFace dataset repo in the form "owner/name".
+    /// Read from OPENCLAW_DATASET_REPO (canonical HuggingClaw variable).
     dataset_id: String,
     sync_interval: Duration,
     workspace: PathBuf,
@@ -144,7 +149,13 @@ async fn run() -> Result<()> {
 
 fn load_config() -> Result<Config> {
     let token = env::var("HF_TOKEN").context("HF_TOKEN is required")?;
-    let dataset_id = env::var("HF_DATASET_ID").context("HF_DATASET_ID is required")?;
+
+    // Accept OPENCLAW_DATASET_REPO (canonical HuggingClaw name) with
+    // HF_DATASET_ID as a legacy fallback so old Space configs keep working.
+    let dataset_id = env::var("OPENCLAW_DATASET_REPO")
+        .or_else(|_| env::var("HF_DATASET_ID"))
+        .context("OPENCLAW_DATASET_REPO (or HF_DATASET_ID) is required")?;
+
     validate_dataset_id(&dataset_id)?;
 
     let sync_interval_secs: u64 = env::var("SYNC_INTERVAL")
@@ -169,7 +180,9 @@ fn validate_dataset_id(dataset_id: &str) -> Result<()> {
     let owner = parts.next().unwrap_or_default();
     let repo = parts.next().unwrap_or_default();
     if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
-        return Err(anyhow!("HF_DATASET_ID must be in form owner/name"));
+        return Err(anyhow!(
+            "OPENCLAW_DATASET_REPO must be in the form owner/name"
+        ));
     }
     Ok(())
 }
@@ -204,11 +217,24 @@ async fn ensure_dataset_exists(client: &reqwest::Client, cfg: &Config) -> Result
             Ok(())
         }
         StatusCode::NOT_FOUND => {
-            eprintln!(
-                "dataset {} not found, creating private dataset",
-                cfg.dataset_id
-            );
-            create_private_dataset(client, cfg).await
+            // Only auto-create if the user has opted in.
+            let auto_create = env::var("AUTO_CREATE_DATASET")
+                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+
+            if auto_create {
+                eprintln!(
+                    "dataset {} not found, AUTO_CREATE_DATASET=true — creating private dataset",
+                    cfg.dataset_id
+                );
+                create_private_dataset(client, cfg).await
+            } else {
+                Err(anyhow!(
+                    "dataset {} not found. Create it on huggingface.co/new-dataset \
+                     or set AUTO_CREATE_DATASET=true to create it automatically.",
+                    cfg.dataset_id
+                ))
+            }
         }
         status => {
             let body = response.text().await.unwrap_or_default();
@@ -221,7 +247,7 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
     let (owner, name) = cfg
         .dataset_id
         .split_once('/')
-        .ok_or_else(|| anyhow!("HF_DATASET_ID must be in form owner/name"))?;
+        .ok_or_else(|| anyhow!("OPENCLAW_DATASET_REPO must be in the form owner/name"))?;
 
     let me_url = "https://huggingface.co/api/whoami-v2";
     let username = client
@@ -263,7 +289,7 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
 }
 
 async fn pull_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    eprintln!("pulling workspace from Hugging Face dataset");
+    eprintln!("pulling workspace from HuggingFace dataset: {}", cfg.dataset_id);
     let remote_files = list_remote_files(client, cfg).await?;
 
     for file in &remote_files {
@@ -287,7 +313,7 @@ async fn pull_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
         f.write_all(&bytes).await?;
     }
 
-    eprintln!("pull complete with {} files", remote_files.len());
+    eprintln!("pull complete: {} files restored", remote_files.len());
     Ok(())
 }
 
@@ -311,7 +337,7 @@ async fn list_remote_files(client: &reqwest::Client, cfg: &Config) -> Result<Vec
 }
 
 async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    eprintln!("pushing workspace updates to Hugging Face");
+    eprintln!("pushing workspace updates to HuggingFace");
     let state_path = cfg.workspace.join(STATE_FILE);
     let mut state = load_state(&state_path).await?;
 
@@ -433,7 +459,6 @@ async fn load_state(path: &Path) -> Result<SyncState> {
     if !path.exists() {
         return Ok(SyncState::default());
     }
-
     let raw = tokio::fs::read(path).await?;
     let state = serde_json::from_slice(&raw).context("failed to parse sync state file")?;
     Ok(state)
@@ -449,7 +474,7 @@ fn spawn_child_from_args() -> Result<Child> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         return Err(anyhow!(
-            "no command provided. pass the main process command as entrypoint arguments"
+            "no command provided — pass the main process command as entrypoint arguments"
         ));
     }
 
@@ -470,7 +495,7 @@ fn forward_sigterm(child: &mut Child) {
         let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) };
         if ret != 0 {
             eprintln!(
-                "failed to forward SIGTERM: errno={}",
+                "failed to forward SIGTERM: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -495,7 +520,7 @@ async fn wait_for_child_shutdown(child: &mut Child) {
                 let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGKILL) };
                 if ret != 0 {
                     eprintln!(
-                        "failed to SIGKILL child: errno={}",
+                        "failed to SIGKILL child: {}",
                         std::io::Error::last_os_error()
                     );
                 }
