@@ -17,19 +17,57 @@ use walkdir::WalkDir;
 const WORKSPACE_DIR: &str = "/home/user/.openclaw";
 const STATE_FILE: &str = ".hf-sync-state.json";
 const FINAL_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How long to wait for HF to become reachable at startup before giving up
-/// and continuing with an empty / local workspace.
 const NETWORK_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const NETWORK_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+// ── Config ────────────────────────────────────────────────────────────────────
+
+/// Sync config — optional: if HF_TOKEN or OPENCLAW_DATASET_REPO are absent,
+/// syncing is simply disabled and OpenClaw still starts normally.
 #[derive(Debug, Clone)]
-struct Config {
+struct SyncConfig {
     token: String,
     dataset_id: String,
     sync_interval: Duration,
     workspace: PathBuf,
 }
+
+impl SyncConfig {
+    /// Returns None (with a warning) instead of crashing when secrets are missing.
+    fn load() -> Option<Self> {
+        let token = match env::var("HF_TOKEN") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!("[sync] HF_TOKEN not set — HF dataset sync disabled");
+                return None;
+            }
+        };
+
+        let dataset_id = env::var("OPENCLAW_DATASET_REPO")
+            .or_else(|_| env::var("HF_DATASET_ID"))
+            .unwrap_or_default();
+
+        if dataset_id.is_empty() || dataset_id.split('/').count() != 2 {
+            eprintln!("[sync] OPENCLAW_DATASET_REPO not set or invalid — HF dataset sync disabled");
+            return None;
+        }
+
+        let sync_interval_secs: u64 = env::var("SYNC_INTERVAL")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse()
+            .unwrap_or(60)
+            .max(1);
+
+        Some(SyncConfig {
+            token,
+            dataset_id,
+            sync_interval: Duration::from_secs(sync_interval_secs),
+            workspace: PathBuf::from(WORKSPACE_DIR),
+        })
+    }
+}
+
+// ── HF API types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct RepoLookup {
@@ -63,11 +101,7 @@ struct CommitRequest {
 #[serde(tag = "op")]
 enum CommitOperation {
     #[serde(rename = "addOrUpdate")]
-    AddOrUpdate {
-        path: String,
-        encoding: String,
-        content: String,
-    },
+    AddOrUpdate { path: String, encoding: String, content: String },
     #[serde(rename = "delete")]
     Delete { path: String },
 }
@@ -83,6 +117,8 @@ struct FileState {
     size: u64,
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -92,67 +128,75 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let cfg = load_config()?;
-    tokio::fs::create_dir_all(&cfg.workspace)
+    // Always create the workspace dir — OpenClaw may need it regardless of sync.
+    let workspace = PathBuf::from(WORKSPACE_DIR);
+    tokio::fs::create_dir_all(&workspace)
         .await
         .context("failed to create workspace directory")?;
 
-    let client = build_client(&cfg)?;
+    // Load sync config — None means sync is disabled, container still runs.
+    let sync = SyncConfig::load();
 
-    // ── Startup sync: wait for network, then pull. Non-fatal on failure. ────────
-    // HF Space containers sometimes take 10-30s for DNS/routing to become
-    // available after the container starts. We wait up to 60s, then proceed.
-    eprintln!("waiting for network connectivity to huggingface.co…");
-    match wait_for_network(&client).await {
-        true => {
-            eprintln!("network is up — proceeding with startup sync");
-            if let Err(err) = startup_sync(&client, &cfg).await {
-                eprintln!("startup sync failed (continuing with local workspace): {err:#}");
+    if let Some(cfg) = &sync {
+        let client = build_client(cfg)?;
+
+        eprintln!("[sync] waiting for network…");
+        if wait_for_network(&client).await {
+            eprintln!("[sync] network up — running startup sync");
+            if let Err(e) = startup_sync(&client, cfg).await {
+                eprintln!("[sync] startup sync failed (continuing): {e:#}");
             }
+        } else {
+            eprintln!("[sync] network unavailable after {:?} — skipping startup sync", NETWORK_STARTUP_TIMEOUT);
         }
-        false => {
-            eprintln!(
-                "huggingface.co unreachable after {:?} — starting with local workspace",
-                NETWORK_STARTUP_TIMEOUT
-            );
-        }
+
+        rebuild_sync_state(&cfg.workspace).await?;
     }
 
-    rebuild_sync_state(&cfg.workspace).await?;
-
-    // ── Spawn child process ──────────────────────────────────────────────────────
+    // Spawn the child process (start.sh → LiteLLM + OpenClaw).
     let mut child = spawn_child_from_args()?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut ticker = interval(cfg.sync_interval);
 
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                if let Err(err) = push_workspace(&client, &cfg).await {
-                    eprintln!("periodic push failed: {err:#}");
-                }
-            }
-            _ = sigterm.recv() => {
-                eprintln!("received SIGTERM — forwarding and running final sync");
-                forward_sigterm(&mut child);
-                if let Err(err) = push_workspace(&client, &cfg).await {
-                    eprintln!("final push failed: {err:#}");
-                }
-                wait_for_child_shutdown(&mut child).await;
-                break;
-            }
-            status = child.wait() => {
-                match status {
-                    Ok(s) => {
-                        eprintln!("child exited: {s}");
-                        if let Err(err) = push_workspace(&client, &cfg).await {
-                            eprintln!("final push after child exit failed: {err:#}");
-                        }
-                        exit(s.code().unwrap_or(1));
+    if let Some(cfg) = &sync {
+        // Sync loop — only active when sync is configured.
+        let client = build_client(cfg)?;
+        let mut ticker = interval(cfg.sync_interval);
+        ticker.reset(); // skip the immediate first tick
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = push_workspace(&client, cfg).await {
+                        eprintln!("[sync] periodic push failed: {e:#}");
                     }
-                    Err(err) => {
-                        eprintln!("error waiting for child: {err:#}");
-                        break;
+                }
+                _ = sigterm.recv() => {
+                    eprintln!("[sync] SIGTERM — final push then shutdown");
+                    forward_sigterm(&mut child);
+                    if let Err(e) = push_workspace(&client, cfg).await {
+                        eprintln!("[sync] final push failed: {e:#}");
+                    }
+                    wait_for_child_shutdown(&mut child).await;
+                    break;
+                }
+                status = child.wait() => {
+                    handle_child_exit(status, &client, cfg).await;
+                }
+            }
+        }
+    } else {
+        // No sync — just supervise the child.
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    forward_sigterm(&mut child);
+                    wait_for_child_shutdown(&mut child).await;
+                    break;
+                }
+                status = child.wait() => {
+                    match status {
+                        Ok(s) => exit(s.code().unwrap_or(1)),
+                        Err(e) => { eprintln!("child wait error: {e:#}"); break; }
                     }
                 }
             }
@@ -162,87 +206,62 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Poll HF until reachable or timeout. Returns true if network came up.
-async fn wait_for_network(client: &reqwest::Client) -> bool {
-    let probe_url = "https://huggingface.co/api/whoami-v2";
-    let deadline = tokio::time::Instant::now() + NETWORK_STARTUP_TIMEOUT;
-
-    loop {
-        // Use a short per-attempt timeout so we fail fast and retry
-        let attempt = timeout(
-            Duration::from_secs(8),
-            client.get(probe_url).send(),
-        )
-        .await;
-
-        match attempt {
-            // Any HTTP response (even 401) means DNS + routing is working
-            Ok(Ok(_)) => return true,
-            Ok(Err(err)) => eprintln!("network probe error: {err}"),
-            Err(_) => eprintln!("network probe timed out"),
+async fn handle_child_exit(
+    status: std::io::Result<std::process::ExitStatus>,
+    client: &reqwest::Client,
+    cfg: &SyncConfig,
+) -> ! {
+    match status {
+        Ok(s) => {
+            eprintln!("[sync] child exited: {s}");
+            if let Err(e) = push_workspace(client, cfg).await {
+                eprintln!("[sync] final push after child exit failed: {e:#}");
+            }
+            exit(s.code().unwrap_or(1));
         }
+        Err(e) => {
+            eprintln!("child wait error: {e:#}");
+            exit(1);
+        }
+    }
+}
 
+// ── Network probe ─────────────────────────────────────────────────────────────
+
+async fn wait_for_network(client: &reqwest::Client) -> bool {
+    let url = "https://huggingface.co/api/whoami-v2";
+    let deadline = tokio::time::Instant::now() + NETWORK_STARTUP_TIMEOUT;
+    loop {
+        let res = timeout(Duration::from_secs(8), client.get(url).send()).await;
+        match res {
+            Ok(Ok(_)) => return true,   // any HTTP response = DNS is working
+            Ok(Err(e)) => eprintln!("[sync] probe error: {e}"),
+            Err(_)     => eprintln!("[sync] probe timeout"),
+        }
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-
-        eprintln!("retrying in {:?}…", NETWORK_RETRY_INTERVAL);
+        eprintln!("[sync] retrying in {:?}…", NETWORK_RETRY_INTERVAL);
         sleep(NETWORK_RETRY_INTERVAL).await;
     }
 }
 
-/// Pull workspace from HF dataset on first boot.
-async fn startup_sync(client: &reqwest::Client, cfg: &Config) -> Result<()> {
+// ── Startup sync ──────────────────────────────────────────────────────────────
+
+async fn startup_sync(client: &reqwest::Client, cfg: &SyncConfig) -> Result<()> {
     ensure_dataset_exists(client, cfg).await?;
     pull_workspace(client, cfg).await
 }
 
-fn load_config() -> Result<Config> {
-    let token = env::var("HF_TOKEN").context("HF_TOKEN is required")?;
+// ── HF API ────────────────────────────────────────────────────────────────────
 
-    let dataset_id = env::var("OPENCLAW_DATASET_REPO")
-        .or_else(|_| env::var("HF_DATASET_ID"))
-        .context("OPENCLAW_DATASET_REPO (or HF_DATASET_ID) is required")?;
-
-    validate_dataset_id(&dataset_id)?;
-
-    let sync_interval_secs: u64 = env::var("SYNC_INTERVAL")
-        .unwrap_or_else(|_| "60".to_string())
-        .parse()
-        .context("SYNC_INTERVAL must be an integer")?;
-
-    if sync_interval_secs == 0 {
-        return Err(anyhow!("SYNC_INTERVAL must be > 0"));
-    }
-
-    Ok(Config {
-        token,
-        dataset_id,
-        sync_interval: Duration::from_secs(sync_interval_secs),
-        workspace: PathBuf::from(WORKSPACE_DIR),
-    })
-}
-
-fn validate_dataset_id(id: &str) -> Result<()> {
-    let mut parts = id.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let repo = parts.next().unwrap_or_default();
-    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
-        return Err(anyhow!("OPENCLAW_DATASET_REPO must be owner/name"));
-    }
-    Ok(())
-}
-
-fn build_client(cfg: &Config) -> Result<reqwest::Client> {
+fn build_client(cfg: &SyncConfig) -> Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
-        format!("Bearer {}", cfg.token)
-            .parse()
-            .context("invalid HF_TOKEN")?,
+        format!("Bearer {}", cfg.token).parse().context("invalid HF_TOKEN")?,
     );
     headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
     reqwest::Client::builder()
         .default_headers(headers)
         .timeout(Duration::from_secs(30))
@@ -250,52 +269,40 @@ fn build_client(cfg: &Config) -> Result<reqwest::Client> {
         .context("failed to build HTTP client")
 }
 
-async fn ensure_dataset_exists(client: &reqwest::Client, cfg: &Config) -> Result<()> {
+async fn ensure_dataset_exists(client: &reqwest::Client, cfg: &SyncConfig) -> Result<()> {
     let url = format!("https://huggingface.co/api/datasets/{}", cfg.dataset_id);
     let resp = client.get(&url).send().await?;
-
     match resp.status() {
         StatusCode::OK => {
             let repo: RepoLookup = resp.json().await.unwrap_or(RepoLookup { id: None });
-            eprintln!("dataset ok: {}", repo.id.unwrap_or(cfg.dataset_id.clone()));
+            eprintln!("[sync] dataset ok: {}", repo.id.unwrap_or(cfg.dataset_id.clone()));
             Ok(())
         }
         StatusCode::NOT_FOUND => {
             let auto = env::var("AUTO_CREATE_DATASET")
-                .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .map(|v| matches!(v.to_lowercase().as_str(), "1"|"true"|"yes"|"on"))
                 .unwrap_or(false);
             if auto {
-                eprintln!("dataset not found — AUTO_CREATE_DATASET=true, creating…");
+                eprintln!("[sync] dataset not found — creating…");
                 create_private_dataset(client, cfg).await
             } else {
                 Err(anyhow!(
-                    "dataset {} not found. Create it at huggingface.co/new-dataset \
-                     or set AUTO_CREATE_DATASET=true.",
+                    "dataset {} not found. Create it or set AUTO_CREATE_DATASET=true",
                     cfg.dataset_id
                 ))
             }
         }
-        s => Err(anyhow!(
-            "dataset lookup failed ({s}): {}",
-            resp.text().await.unwrap_or_default()
-        )),
+        s => Err(anyhow!("dataset lookup failed ({s}): {}", resp.text().await.unwrap_or_default())),
     }
 }
 
-async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Result<()> {
+async fn create_private_dataset(client: &reqwest::Client, cfg: &SyncConfig) -> Result<()> {
     let (owner, name) = cfg.dataset_id.split_once('/').unwrap();
-
     let username = client
         .get("https://huggingface.co/api/whoami-v2")
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
+        .send().await?.error_for_status()?
+        .json::<serde_json::Value>().await?
+        .get("name").and_then(|v| v.as_str()).unwrap_or("").to_owned();
 
     let req = CreateRepoRequest {
         name: name.to_string(),
@@ -303,90 +310,54 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
         private: true,
         repo_type: "dataset".to_string(),
     };
-
-    let resp = client
-        .post("https://huggingface.co/api/repos/create")
-        .json(&req)
-        .send()
-        .await?;
-
+    let resp = client.post("https://huggingface.co/api/repos/create").json(&req).send().await?;
     if resp.status().is_success() || resp.status() == StatusCode::CONFLICT {
         Ok(())
     } else {
-        Err(anyhow!(
-            "create dataset failed ({}): {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ))
+        Err(anyhow!("create dataset failed ({}): {}", resp.status(), resp.text().await.unwrap_or_default()))
     }
 }
 
-async fn pull_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    eprintln!("pulling workspace from {}", cfg.dataset_id);
+async fn pull_workspace(client: &reqwest::Client, cfg: &SyncConfig) -> Result<()> {
+    eprintln!("[sync] pulling from {}", cfg.dataset_id);
     let files = list_remote_files(client, cfg).await?;
-
     for file in &files {
-        let url = format!(
-            "https://huggingface.co/datasets/{}/resolve/main/{}",
-            cfg.dataset_id, file
-        );
+        let url = format!("https://huggingface.co/datasets/{}/resolve/main/{}", cfg.dataset_id, file);
         let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
         let target = cfg.workspace.join(file);
-        if let Some(p) = target.parent() {
-            tokio::fs::create_dir_all(p).await?;
-        }
+        if let Some(p) = target.parent() { tokio::fs::create_dir_all(p).await?; }
         let mut f = tokio::fs::File::create(&target).await?;
         f.write_all(&bytes).await?;
     }
-
-    eprintln!("pull complete: {} files", files.len());
+    eprintln!("[sync] pull complete: {} files", files.len());
     Ok(())
 }
 
-async fn list_remote_files(client: &reqwest::Client, cfg: &Config) -> Result<Vec<String>> {
+async fn list_remote_files(client: &reqwest::Client, cfg: &SyncConfig) -> Result<Vec<String>> {
     let url = format!(
         "https://huggingface.co/api/datasets/{}/tree/main?recursive=true",
         cfg.dataset_id
     );
     let resp = client.get(url).send().await?;
-    if resp.status() == StatusCode::NOT_FOUND {
-        return Ok(vec![]);
-    }
+    if resp.status() == StatusCode::NOT_FOUND { return Ok(vec![]); }
     let entries: Vec<TreeEntry> = resp.error_for_status()?.json().await?;
     Ok(entries.into_iter().filter(|e| e.kind == "file").map(|e| e.path).collect())
 }
 
-async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
+async fn push_workspace(client: &reqwest::Client, cfg: &SyncConfig) -> Result<()> {
     let state_path = cfg.workspace.join(STATE_FILE);
     let mut state = load_state(&state_path).await?;
-
     let mut current = HashMap::<String, FileState>::new();
     let mut operations = Vec::<CommitOperation>::new();
 
-    for entry in WalkDir::new(&cfg.workspace)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in WalkDir::new(&cfg.workspace).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
         let full = entry.path();
-        if full == state_path {
-            continue;
-        }
-        let rel = full
-            .strip_prefix(&cfg.workspace)?
-            .to_string_lossy()
-            .replace('\\', "/");
-
+        if full == state_path { continue; }
+        let rel = full.strip_prefix(&cfg.workspace)?.to_string_lossy().replace('\\', "/");
         let bytes = tokio::fs::read(full).await?;
         let md5 = format!("{:x}", md5::compute(&bytes));
         let size = bytes.len() as u64;
-
-        let changed = state
-            .files
-            .get(&rel)
-            .map(|s| s.md5 != md5 || s.size != size)
-            .unwrap_or(true);
-
+        let changed = state.files.get(&rel).map(|s| s.md5 != md5 || s.size != size).unwrap_or(true);
         if changed {
             operations.push(CommitOperation::AddOrUpdate {
                 path: rel.clone(),
@@ -403,68 +374,38 @@ async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
         operations.push(CommitOperation::Delete { path: removed.clone() });
     }
 
-    if operations.is_empty() {
-        eprintln!("no workspace changes");
-        return Ok(());
-    }
+    if operations.is_empty() { eprintln!("[sync] no changes"); return Ok(()); }
 
-    let req = CommitRequest {
-        commit: format!("sync {} files", operations.len()),
-        operations,
-    };
+    let resp = client
+        .post(format!("https://huggingface.co/api/datasets/{}/commit/main", cfg.dataset_id))
+        .json(&CommitRequest { commit: format!("sync {} files", operations.len()), operations })
+        .send().await?;
 
-    let url = format!(
-        "https://huggingface.co/api/datasets/{}/commit/main",
-        cfg.dataset_id
-    );
-    let resp = client.post(url).json(&req).send().await?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "push failed ({}): {}",
-            resp.status(),
-            resp.text().await.unwrap_or_default()
-        ));
+        return Err(anyhow!("push failed ({}): {}", resp.status(), resp.text().await.unwrap_or_default()));
     }
-
     state.files = current;
     save_state(&state_path, &state).await?;
-    eprintln!("push complete");
+    eprintln!("[sync] push complete");
     Ok(())
 }
 
 async fn rebuild_sync_state(workspace: &Path) -> Result<()> {
     let state_path = workspace.join(STATE_FILE);
     let mut files = HashMap::new();
-
-    for entry in WalkDir::new(workspace)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in WalkDir::new(workspace).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
         let full = entry.path();
-        if full == state_path {
-            continue;
-        }
-        let rel = full
-            .strip_prefix(workspace)?
-            .to_string_lossy()
-            .replace('\\', "/");
+        if full == state_path { continue; }
+        let rel = full.strip_prefix(workspace)?.to_string_lossy().replace('\\', "/");
         let bytes = tokio::fs::read(full).await?;
-        files.insert(rel, FileState {
-            md5: format!("{:x}", md5::compute(&bytes)),
-            size: bytes.len() as u64,
-        });
+        files.insert(rel, FileState { md5: format!("{:x}", md5::compute(&bytes)), size: bytes.len() as u64 });
     }
-
     save_state(&state_path, &SyncState { files }).await
 }
 
 async fn load_state(path: &Path) -> Result<SyncState> {
-    if !path.exists() {
-        return Ok(SyncState::default());
-    }
-    let raw = tokio::fs::read(path).await?;
-    Ok(serde_json::from_slice(&raw).context("bad sync state")?)
+    if !path.exists() { return Ok(SyncState::default()); }
+    Ok(serde_json::from_slice(&tokio::fs::read(path).await?).context("bad sync state")?)
 }
 
 async fn save_state(path: &Path, state: &SyncState) -> Result<()> {
@@ -472,25 +413,24 @@ async fn save_state(path: &Path, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
+// ── Child process ─────────────────────────────────────────────────────────────
+
 fn spawn_child_from_args() -> Result<Child> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        return Err(anyhow!("no child command provided"));
-    }
+    if args.is_empty() { return Err(anyhow!("no child command provided")); }
     Command::new(&args[0])
         .args(&args[1..])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to spawn child process")
+        .context("failed to spawn child")
 }
 
 fn forward_sigterm(child: &mut Child) {
     if let Some(id) = child.id() {
         // SAFETY: valid pid from live child
-        let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) };
-        if ret != 0 {
+        if unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) } != 0 {
             eprintln!("SIGTERM forward failed: {}", std::io::Error::last_os_error());
         }
     }
@@ -501,7 +441,7 @@ async fn wait_for_child_shutdown(child: &mut Child) {
         Ok(Ok(s)) => eprintln!("child exited after SIGTERM: {s}"),
         Ok(Err(e)) => eprintln!("wait error: {e:#}"),
         Err(_) => {
-            eprintln!("child timeout — sending SIGKILL");
+            eprintln!("child timeout — SIGKILL");
             if let Some(id) = child.id() {
                 // SAFETY: valid pid from live child
                 unsafe { libc::kill(id as libc::pid_t, libc::SIGKILL) };
