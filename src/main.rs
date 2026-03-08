@@ -14,9 +14,8 @@ use tokio::process::{Child, Command};
 use tokio::time::{interval, timeout};
 use walkdir::WalkDir;
 
-/// The OpenClaw config directory we sync to/from HuggingFace.
-/// Must match the path OpenClaw itself writes to (HOME=/home/node).
-const WORKSPACE_DIR: &str = "/home/node/.openclaw";
+/// The OpenClaw config directory synced to/from HuggingFace.
+const WORKSPACE_DIR: &str = "/home/user/.openclaw";
 
 const STATE_FILE: &str = ".hf-sync-state.json";
 const FINAL_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -24,8 +23,6 @@ const FINAL_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone)]
 struct Config {
     token: String,
-    /// HuggingFace dataset repo in the form "owner/name".
-    /// Read from OPENCLAW_DATASET_REPO (canonical HuggingClaw variable).
     dataset_id: String,
     sync_interval: Duration,
     workspace: PathBuf,
@@ -115,7 +112,7 @@ async fn run() -> Result<()> {
                 }
             }
             _ = sigterm.recv() => {
-                eprintln!("received SIGTERM, forwarding and running final sync");
+                eprintln!("received SIGTERM — forwarding and running final sync");
                 forward_sigterm(&mut child);
                 if let Err(err) = push_workspace(&client, &cfg).await {
                     eprintln!("final push failed: {err:#}");
@@ -125,15 +122,12 @@ async fn run() -> Result<()> {
             }
             status = child.wait() => {
                 match status {
-                    Ok(status) => {
-                        eprintln!("child exited with status: {status}");
+                    Ok(s) => {
+                        eprintln!("child exited with status: {s}");
                         if let Err(err) = push_workspace(&client, &cfg).await {
                             eprintln!("final push after child exit failed: {err:#}");
                         }
-                        match status.code() {
-                            Some(code) => exit(code),
-                            None => exit(1),
-                        }
+                        exit(s.code().unwrap_or(1));
                     }
                     Err(err) => {
                         eprintln!("failed waiting for child: {err:#}");
@@ -150,8 +144,7 @@ async fn run() -> Result<()> {
 fn load_config() -> Result<Config> {
     let token = env::var("HF_TOKEN").context("HF_TOKEN is required")?;
 
-    // Accept OPENCLAW_DATASET_REPO (canonical HuggingClaw name) with
-    // HF_DATASET_ID as a legacy fallback so old Space configs keep working.
+    // Accept OPENCLAW_DATASET_REPO (canonical) with HF_DATASET_ID as fallback.
     let dataset_id = env::var("OPENCLAW_DATASET_REPO")
         .or_else(|_| env::var("HF_DATASET_ID"))
         .context("OPENCLAW_DATASET_REPO (or HF_DATASET_ID) is required")?;
@@ -193,7 +186,7 @@ fn build_client(cfg: &Config) -> Result<reqwest::Client> {
         AUTHORIZATION,
         format!("Bearer {}", cfg.token)
             .parse()
-            .context("invalid HF token for auth header")?,
+            .context("invalid HF_TOKEN for auth header")?,
     );
     headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
@@ -204,34 +197,27 @@ fn build_client(cfg: &Config) -> Result<reqwest::Client> {
 }
 
 async fn ensure_dataset_exists(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    let lookup_url = format!("https://huggingface.co/api/datasets/{}", cfg.dataset_id);
-    let response = client.get(&lookup_url).send().await?;
+    let url = format!("https://huggingface.co/api/datasets/{}", cfg.dataset_id);
+    let response = client.get(&url).send().await?;
 
     match response.status() {
         StatusCode::OK => {
             let repo: RepoLookup = response.json().await.unwrap_or(RepoLookup { id: None });
-            eprintln!(
-                "dataset exists: {}",
-                repo.id.unwrap_or(cfg.dataset_id.clone())
-            );
+            eprintln!("dataset exists: {}", repo.id.unwrap_or(cfg.dataset_id.clone()));
             Ok(())
         }
         StatusCode::NOT_FOUND => {
-            // Only auto-create if the user has opted in.
             let auto_create = env::var("AUTO_CREATE_DATASET")
                 .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false);
 
             if auto_create {
-                eprintln!(
-                    "dataset {} not found, AUTO_CREATE_DATASET=true — creating private dataset",
-                    cfg.dataset_id
-                );
+                eprintln!("dataset {} not found — AUTO_CREATE_DATASET=true, creating…", cfg.dataset_id);
                 create_private_dataset(client, cfg).await
             } else {
                 Err(anyhow!(
-                    "dataset {} not found. Create it on huggingface.co/new-dataset \
-                     or set AUTO_CREATE_DATASET=true to create it automatically.",
+                    "dataset {} not found. Create it at huggingface.co/new-dataset \
+                     or set AUTO_CREATE_DATASET=true.",
                     cfg.dataset_id
                 ))
             }
@@ -249,9 +235,8 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
         .split_once('/')
         .ok_or_else(|| anyhow!("OPENCLAW_DATASET_REPO must be in the form owner/name"))?;
 
-    let me_url = "https://huggingface.co/api/whoami-v2";
     let username = client
-        .get(me_url)
+        .get("https://huggingface.co/api/whoami-v2")
         .send()
         .await?
         .error_for_status()?
@@ -264,11 +249,7 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
 
     let req = CreateRepoRequest {
         name: name.to_string(),
-        organization: if owner == username {
-            None
-        } else {
-            Some(owner.to_string())
-        },
+        organization: if owner == username { None } else { Some(owner.to_string()) },
         private: true,
         repo_type: "dataset".to_string(),
     };
@@ -289,22 +270,15 @@ async fn create_private_dataset(client: &reqwest::Client, cfg: &Config) -> Resul
 }
 
 async fn pull_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    eprintln!("pulling workspace from HuggingFace dataset: {}", cfg.dataset_id);
+    eprintln!("pulling workspace from HuggingFace: {}", cfg.dataset_id);
     let remote_files = list_remote_files(client, cfg).await?;
 
     for file in &remote_files {
-        let download_url = format!(
+        let url = format!(
             "https://huggingface.co/datasets/{}/resolve/main/{}",
             cfg.dataset_id, file
         );
-        let bytes = client
-            .get(download_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-
+        let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
         let target = cfg.workspace.join(file);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -326,18 +300,12 @@ async fn list_remote_files(client: &reqwest::Client, cfg: &Config) -> Result<Vec
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(Vec::new());
     }
-
-    let response = response.error_for_status()?;
-    let entries: Vec<TreeEntry> = response.json().await?;
-    Ok(entries
-        .into_iter()
-        .filter(|e| e.kind == "file")
-        .map(|e| e.path)
-        .collect())
+    let entries: Vec<TreeEntry> = response.error_for_status()?.json().await?;
+    Ok(entries.into_iter().filter(|e| e.kind == "file").map(|e| e.path).collect())
 }
 
 async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
-    eprintln!("pushing workspace updates to HuggingFace");
+    eprintln!("pushing workspace to HuggingFace…");
     let state_path = cfg.workspace.join(STATE_FILE);
     let mut state = load_state(&state_path).await?;
 
@@ -363,10 +331,6 @@ async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
         let bytes = tokio::fs::read(full_path).await?;
         let md5 = format!("{:x}", md5::compute(&bytes));
         let size = bytes.len() as u64;
-        let file_state = FileState {
-            md5: md5.clone(),
-            size,
-        };
 
         let changed = state
             .files
@@ -375,23 +339,20 @@ async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
             .unwrap_or(true);
 
         if changed {
-            let content = base64::engine::general_purpose::STANDARD.encode(bytes);
             operations.push(CommitOperation::AddOrUpdate {
                 path: relative.clone(),
                 encoding: "base64".to_string(),
-                content,
+                content: base64::engine::general_purpose::STANDARD.encode(&bytes),
             });
         }
 
-        current.insert(relative, file_state);
+        current.insert(relative, FileState { md5, size });
     }
 
     let old_paths: HashSet<_> = state.files.keys().cloned().collect();
     let new_paths: HashSet<_> = current.keys().cloned().collect();
     for removed in old_paths.difference(&new_paths) {
-        operations.push(CommitOperation::Delete {
-            path: removed.clone(),
-        });
+        operations.push(CommitOperation::Delete { path: removed.clone() });
     }
 
     if operations.is_empty() {
@@ -418,7 +379,6 @@ async fn push_workspace(client: &reqwest::Client, cfg: &Config) -> Result<()> {
     state.files = current;
     save_state(&state_path, &state).await?;
     eprintln!("push complete");
-
     Ok(())
 }
 
@@ -435,21 +395,16 @@ async fn rebuild_sync_state(workspace: &Path) -> Result<()> {
         if full_path == state_path {
             continue;
         }
-
         let relative = full_path
             .strip_prefix(workspace)
             .context("failed to strip workspace prefix")?
             .to_string_lossy()
             .replace('\\', "/");
         let bytes = tokio::fs::read(full_path).await?;
-
-        files.insert(
-            relative,
-            FileState {
-                md5: format!("{:x}", md5::compute(&bytes)),
-                size: bytes.len() as u64,
-            },
-        );
+        files.insert(relative, FileState {
+            md5: format!("{:x}", md5::compute(&bytes)),
+            size: bytes.len() as u64,
+        });
     }
 
     save_state(&state_path, &SyncState { files }).await
@@ -460,13 +415,11 @@ async fn load_state(path: &Path) -> Result<SyncState> {
         return Ok(SyncState::default());
     }
     let raw = tokio::fs::read(path).await?;
-    let state = serde_json::from_slice(&raw).context("failed to parse sync state file")?;
-    Ok(state)
+    Ok(serde_json::from_slice(&raw).context("failed to parse sync state file")?)
 }
 
 async fn save_state(path: &Path, state: &SyncState) -> Result<()> {
-    let raw = serde_json::to_vec_pretty(state)?;
-    tokio::fs::write(path, raw).await?;
+    tokio::fs::write(path, serde_json::to_vec_pretty(state)?).await?;
     Ok(())
 }
 
@@ -474,55 +427,39 @@ fn spawn_child_from_args() -> Result<Child> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         return Err(anyhow!(
-            "no command provided — pass the main process command as entrypoint arguments"
+            "no command provided — pass the child command as entrypoint arguments"
         ));
     }
-
-    let mut command = Command::new(&args[0]);
-    command
+    Command::new(&args[0])
         .args(&args[1..])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    command.spawn().context("failed to spawn child process")
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn child process")
 }
 
-/// Forward SIGTERM to the child process using libc::kill.
 fn forward_sigterm(child: &mut Child) {
     if let Some(id) = child.id() {
-        // SAFETY: id is a valid pid obtained from a live child process.
+        // SAFETY: id is a valid pid from a live child process.
         let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) };
         if ret != 0 {
-            eprintln!(
-                "failed to forward SIGTERM: {}",
-                std::io::Error::last_os_error()
-            );
+            eprintln!("failed to forward SIGTERM: {}", std::io::Error::last_os_error());
         }
     }
 }
 
 async fn wait_for_child_shutdown(child: &mut Child) {
     match timeout(FINAL_WAIT_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => {
-            eprintln!("child exited after SIGTERM with status: {status}");
-        }
-        Ok(Err(err)) => {
-            eprintln!("failed waiting for child after SIGTERM: {err:#}");
-        }
+        Ok(Ok(s)) => eprintln!("child exited after SIGTERM: {s}"),
+        Ok(Err(e)) => eprintln!("error waiting for child after SIGTERM: {e:#}"),
         Err(_) => {
-            eprintln!(
-                "child did not exit within {:?}, sending SIGKILL",
-                FINAL_WAIT_TIMEOUT
-            );
+            eprintln!("child did not exit within {:?} — sending SIGKILL", FINAL_WAIT_TIMEOUT);
             if let Some(id) = child.id() {
-                // SAFETY: id is a valid pid obtained from a live child process.
+                // SAFETY: id is a valid pid from a live child process.
                 let ret = unsafe { libc::kill(id as libc::pid_t, libc::SIGKILL) };
                 if ret != 0 {
-                    eprintln!(
-                        "failed to SIGKILL child: {}",
-                        std::io::Error::last_os_error()
-                    );
+                    eprintln!("failed to SIGKILL: {}", std::io::Error::last_os_error());
                 }
             }
         }
