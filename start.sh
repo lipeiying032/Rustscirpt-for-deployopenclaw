@@ -16,9 +16,12 @@ fi
 # ── 2. Write LiteLLM proxy config ─────────────────────────────────────────────
 LITELLM_CONFIG=/tmp/litellm_config.yaml
 
+# OpenClaw's internally stored default model name — we register it in LiteLLM
+# so any model name OpenClaw sends will be routed to the user's actual provider.
+# The wildcard entry ("*") catches any other model name OpenClaw might send.
 {
   echo "model_list:"
-  echo "  - model_name: default"
+  echo "  - model_name: \"*\""
   echo "    litellm_params:"
   echo "      model: \"${LITELLM_MODEL}\""
   echo "      api_key: \"${LITELLM_API_KEY}\""
@@ -62,7 +65,6 @@ echo "[start.sh] LiteLLM healthy after ${WAITED}s"
 
 # ── 5. Start OpenClaw pointing at LiteLLM proxy ───────────────────────────────
 exec env \
-    OPENCLAW_DEFAULT_MODEL=default \
     OPENAI_API_KEY=litellm-proxy \
     OPENAI_BASE_URL=http://127.0.0.1:4000 \
     openclaw gateway --port 7860 --allow-unconfigured
