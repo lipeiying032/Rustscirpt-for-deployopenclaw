@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
 
+# ── Stage 1: Compile the Rust sync helper ─────────────────────────────────────
 FROM rust:1.94.0-slim-bookworm AS builder
 WORKDIR /app
 
@@ -12,31 +13,37 @@ COPY Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked
 
-FROM mcr.microsoft.com/playwright:v1.51.0-jammy AS runtime
+# ── Stage 2: Runtime — use OpenClaw's official image (Node 22 + openclaw.mjs) ─
+FROM ghcr.io/openclaw/openclaw:latest AS runtime
 
+# Switch to root just long enough to install tini and copy our binary
+USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && apt-get install -y --no-install-recommends tini ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-RUN set -eux; \
-    if ! getent passwd 1000 >/dev/null; then \
-        groupadd -g 1000 user; \
-        useradd -m -u 1000 -g 1000 -s /bin/bash user; \
-    fi; \
-    mkdir -p /home/user/.openclaw/workspace /home/user/app; \
-    chown -R 1000:1000 /home/user
 
 COPY --from=builder /app/target/release/openclaw-hf-sync /usr/local/bin/openclaw-hf-sync
 RUN chmod +x /usr/local/bin/openclaw-hf-sync
 
-ENV HOME=/home/user
-WORKDIR /home/user/app
-USER 1000:1000
+# Ensure the openclaw data dir exists and is owned by the node user (uid 1000)
+RUN mkdir -p /home/node/.openclaw && chown -R node:node /home/node/.openclaw
 
-EXPOSE 7860
+# ── OpenClaw port config ───────────────────────────────────────────────────────
+# HF Space expects the app to listen on 7860 (declared in README.md app_port).
+# We override OpenClaw's default (18789) so the Space health-check passes.
+ENV OPENCLAW_API_PORT=7860 \
+    OPENCLAW_WS_PORT=7861 \
+    HOME=/home/node
 
+EXPOSE 7860 7861
+
+WORKDIR /app
+USER node
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
+# openclaw-hf-sync wraps the child process:
+#   1. pull ~/.openclaw from the HF dataset
+#   2. spawn the OpenClaw gateway (arguments after --)
+#   3. push changes back on a timer and on shutdown
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-hf-sync"]
-# Replace the CMD below with your actual service command, e.g.:
-#   CMD ["node", "server.js"]
-#   CMD ["python", "app.py"]
-CMD ["node", "server.js"]
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
