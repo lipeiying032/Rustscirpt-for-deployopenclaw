@@ -484,11 +484,12 @@ name = "openclaw-hf-sync"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "libc",
  "md5",
  "reqwest",
  "serde",
  "serde_json",
- "shell-words",
  "tokio",
  "walkdir",
 ]
