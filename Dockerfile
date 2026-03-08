@@ -15,38 +15,49 @@ COPY src ./src
 RUN cargo build --release --locked
 
 # ── Stage 2: Runtime ───────────────────────────────────────────────────────────
-# Use the official Playwright image — it has Chromium (required by OpenClaw's
-# browser-control features) and a compatible Node.js version pre-installed.
+# Playwright jammy ships Chromium (required by OpenClaw's browser-control).
 FROM mcr.microsoft.com/playwright:v1.51.0-jammy AS runtime
 
 USER root
 
-# ── 2a. Install Node 22 (Playwright image ships Node 20; OpenClaw requires ≥22)
+# ── 2a. System deps ────────────────────────────────────────────────────────────
+# git      : required by openclaw npm install (avoids "spawn git ENOENT")
+# cmake/make/python3/build-essential : openclaw native deps (canvas, sharp, etc.)
+# python3-venv : isolated LiteLLM install to avoid externally-managed-env errors
+# tini     : proper pid-1 signal forwarding
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends \
+        git tini ca-certificates curl \
+        cmake make build-essential \
+        python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── 2b. Install Node 22 (OpenClaw requires ≥22; Playwright ships Node 20) ─────
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# ── 2b. Install build tools required by openclaw's native deps + tini + Python
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tini \
-        make cmake build-essential python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# ── 2c. Install OpenClaw globally ─────────────────────────────────────────────
+# SHARP_IGNORE_GLOBAL_LIBVIPS=1 : skip system libvips check (avoids build fail)
+# npm_config_cache=/tmp/npm-cache : writable cache dir during build
+RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
+    npm_config_cache=/tmp/npm-cache \
+    npm install -g openclaw@latest \
+    && rm -rf /tmp/npm-cache
 
-# ── 2c. Install OpenClaw globally (provides openclaw.mjs)
-RUN npm install -g openclaw@latest
+# ── 2d. Install LiteLLM into an isolated venv ─────────────────────────────────
+RUN python3 -m venv /opt/litellm-venv \
+    && /opt/litellm-venv/bin/pip install --no-cache-dir "litellm[proxy]"
 
-# ── 2d. Install LiteLLM proxy
-RUN pip3 install --no-cache-dir --break-system-packages "litellm[proxy]"
+# Make litellm available on PATH
+ENV PATH="/opt/litellm-venv/bin:$PATH"
 
-# ── 2e. Copy Rust sync binary + startup script
+# ── 2e. Copy Rust sync binary + startup script ────────────────────────────────
 COPY --from=builder /app/target/release/openclaw-hf-sync /usr/local/bin/openclaw-hf-sync
 COPY start.sh /app/start.sh
 RUN chmod +x /usr/local/bin/openclaw-hf-sync /app/start.sh
 
-# ── 2f. Ensure OpenClaw data dir belongs to the runtime user (uid 1000)
+# ── 2f. Create runtime user (uid 1000) and openclaw data dir ──────────────────
 RUN set -eux; \
     if ! getent passwd 1000 >/dev/null; then \
         groupadd -g 1000 user; \
@@ -56,11 +67,13 @@ RUN set -eux; \
     chown -R 1000:1000 /home/user
 
 # ── Port config ────────────────────────────────────────────────────────────────
-# HF Space health-check expects port 7860.
-# OpenClaw listens on OPENCLAW_API_PORT; LiteLLM Proxy on 4000 (internal only).
+# HF Space health-check uses port 7860.
+# OPENCLAW_API_PORT overrides OpenClaw's default (18789).
+# LiteLLM proxy listens on 127.0.0.1:4000 (internal only).
 ENV OPENCLAW_API_PORT=7860 \
     OPENCLAW_WS_PORT=7861 \
-    HOME=/home/user
+    HOME=/home/user \
+    SHARP_IGNORE_GLOBAL_LIBVIPS=1
 
 EXPOSE 7860 7861
 
@@ -68,9 +81,9 @@ WORKDIR /home/user/app
 USER 1000:1000
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
-# openclaw-hf-sync:
-#   1. Pulls ~/.openclaw workspace from the HF dataset
-#   2. Spawns start.sh  →  LiteLLM proxy (127.0.0.1:4000) + OpenClaw gateway
-#   3. Periodically pushes workspace changes back to HF dataset, and on shutdown
+# openclaw-hf-sync (pid 1 via tini):
+#   1. Pulls ~/.openclaw from the HF dataset
+#   2. Spawns start.sh → LiteLLM proxy + OpenClaw gateway
+#   3. Pushes workspace changes back on a timer and on shutdown
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-hf-sync"]
 CMD ["/app/start.sh"]
