@@ -33,5 +33,10 @@ ENV HOME=/home/user
 WORKDIR /home/user/app
 USER 1000:1000
 
+EXPOSE 7860
+
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/openclaw-hf-sync"]
-CMD ["bash"]
+# Replace the CMD below with your actual service command, e.g.:
+#   CMD ["node", "server.js"]
+#   CMD ["python", "app.py"]
+CMD ["node", "server.js"]
