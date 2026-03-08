@@ -10,9 +10,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml ./
-COPY Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+# Do not copy Cargo.lock — let Cargo resolve a fresh consistent lockfile.
+# (Our hand-edited Cargo.lock drifted from Cargo.toml, causing --locked to fail.)
+RUN cargo build --release
 
 # ── Stage 2: Runtime ───────────────────────────────────────────────────────────
 # Playwright jammy ships Chromium (required by OpenClaw's browser-control).
