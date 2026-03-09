@@ -19,16 +19,14 @@ FROM mcr.microsoft.com/playwright:v1.51.0-jammy AS runtime
 USER root
 
 # ── 2a. System deps ────────────────────────────────────────────────────────────
-# --fix-missing: Ubuntu jammy security mirror periodically drops old python3.10
-# packages causing 404 errors; this flag lets apt fall back to other sources.
-# python3-venv installed separately after --fix-missing pass to ensure it lands.
+# NOTE: python3-venv is intentionally omitted.
+# Ubuntu jammy security mirror has removed python3.10-venv (404), which makes
+# dpkg fail at configure time even with --fix-missing. We use pip directly instead.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends --fix-missing \
+    && apt-get install -y --no-install-recommends \
         git tini ca-certificates curl \
         cmake make build-essential \
-        python3 \
-    && apt-get install -y --no-install-recommends --fix-missing \
-        python3-venv \
+        python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # ── 2b. Install Node 22 (OpenClaw requires ≥22; Playwright ships Node 20) ─────
@@ -42,17 +40,8 @@ RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
     npm install -g openclaw@latest \
     && rm -rf /tmp/npm-cache
 
-# ── 2d. Install LiteLLM into an isolated venv ─────────────────────────────────
-# If python3-venv failed above (very old jammy), fall back to pip --user install
-RUN if python3 -m venv /opt/litellm-venv 2>/dev/null; then \
-        /opt/litellm-venv/bin/pip install --no-cache-dir "litellm[proxy]"; \
-    else \
-        pip3 install --no-cache-dir --break-system-packages "litellm[proxy]"; \
-        mkdir -p /opt/litellm-venv/bin; \
-        ln -sf "$(which litellm)" /opt/litellm-venv/bin/litellm; \
-    fi
-
-ENV PATH="/opt/litellm-venv/bin:$PATH"
+# ── 2d. Install LiteLLM via pip (no venv — jammy's python3.10-venv is broken) ─
+RUN pip3 install --no-cache-dir --break-system-packages "litellm[proxy]"
 
 # ── 2e. Copy Rust sync binary + startup script ────────────────────────────────
 COPY --from=builder /app/target/release/openclaw-hf-sync /usr/local/bin/openclaw-hf-sync
