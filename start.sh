@@ -10,7 +10,7 @@ LITELLM_PID=""
 if [ -z "${LITELLM_API_KEY:-}" ] || [ -z "${LITELLM_MODEL:-}" ]; then
     echo "[start.sh] LITELLM_API_KEY or LITELLM_MODEL not set — starting OpenClaw without LiteLLM proxy"
     echo "[start.sh] You can configure AI providers through OpenClaw's UI after startup"
-    exec openclaw gateway --port 7860 --allow-unconfigured
+    exec openclaw gateway --port 7860 --host 0.0.0.0 --allow-unconfigured
 fi
 
 # ── 2. Write LiteLLM proxy config ─────────────────────────────────────────────
@@ -56,7 +56,7 @@ WAITED=0
 until curl -sf http://127.0.0.1:4000/health/liveliness > /dev/null 2>&1; do
     if [ "$WAITED" -ge "$MAX_WAIT" ]; then
         echo "[start.sh] WARNING: LiteLLM not healthy after ${MAX_WAIT}s — starting OpenClaw without proxy"
-        exec openclaw gateway --port 7860 --allow-unconfigured
+        exec openclaw gateway --port 7860 --host 0.0.0.0 --allow-unconfigured
     fi
     sleep 1
     WAITED=$((WAITED + 1))
@@ -65,8 +65,6 @@ echo "[start.sh] LiteLLM healthy after ${WAITED}s"
 
 # ── 5. Start OpenClaw pointing at LiteLLM proxy ───────────────────────────────
 exec env \
-    OPENCLAW_GATEWAY_BIND=lan \
-    OPENCLAW_GATEWAY_PORT=7860 \
     OPENAI_API_KEY=litellm-proxy \
     OPENAI_BASE_URL=http://127.0.0.1:4000 \
-    openclaw gateway --port 7860  --allow-unconfigured
+    openclaw gateway --port 7860 --host 0.0.0.0 --allow-unconfigured
