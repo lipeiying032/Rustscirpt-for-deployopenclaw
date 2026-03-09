@@ -31,7 +31,7 @@ cat > "${OPENCLAW_CONFIG_DIR}/openclaw.json" << OPENCLAW_JSON
       "litellm": {
         "baseUrl": "http://127.0.0.1:4000",
         "apiKey": "litellm-proxy",
-        "api": "openai-responses",
+        "api": "openai-chat",
         "models": [
           {
             "id": "default",
