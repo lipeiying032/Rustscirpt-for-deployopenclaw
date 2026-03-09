@@ -67,7 +67,7 @@ LITELLM_CONFIG=/tmp/litellm_config.yaml
 
 {
   echo "model_list:"
-  echo "  - model_name: \"*\""
+  echo "  - model_name: \"default\""
   echo "    litellm_params:"
   echo "      model: \"${LITELLM_MODEL}\""
   echo "      api_key: \"${LITELLM_API_KEY}\""
