@@ -4,46 +4,51 @@ set -euo pipefail
 LITELLM_PID=""
 
 # ── 0. Write openclaw.json before gateway starts ──────────────────────────────
-# HF Space domains are dynamically assigned, so we can't hardcode allowedOrigins.
-# dangerouslyAllowHostHeaderOriginFallback lets OpenClaw trust the Host header
-# as the origin — the standard fix for dynamic-domain deployments (Zeabur, HF, etc.)
+# HF Space runs behind a reverse proxy; all browser connections appear as
+# non-loopback to OpenClaw, triggering device pairing. The three flags below
+# are the documented solution for Docker/proxy deployments (github.com/openclaw/openclaw/issues/29801):
+#   - dangerouslyDisableDeviceAuth:           skip device pairing for Control UI
+#   - allowInsecureAuth:                      allow token-only auth over HTTP
+#   - dangerouslyAllowHostHeaderOriginFallback: trust Host header as origin (no hardcoded allowedOrigins needed)
+#
+# gateway.auth.token is pinned via OPENCLAW_GATEWAY_TOKEN env var (set in HF Secrets),
+# or falls back to a fixed default so token never changes between restarts.
 OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_CONFIG_DIR}/openclaw.json"
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
-if [ ! -f "$OPENCLAW_CONFIG" ]; then
-  cat > "$OPENCLAW_CONFIG" << 'OPENCLAW_JSON'
+# Resolve gateway token: prefer env var (set in HF Space secrets), else use fixed fallback
+GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-openclaw-hf-default-token}"
+
+cat > "$OPENCLAW_CONFIG" << OPENCLAW_JSON
 {
   "gateway": {
+    "mode": "local",
     "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "${GATEWAY_TOKEN}"
+    },
     "controlUi": {
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true
     }
   }
 }
 OPENCLAW_JSON
-  echo "[start.sh] openclaw.json written (dangerouslyAllowHostHeaderOriginFallback=true)"
-else
-  echo "[start.sh] openclaw.json exists — patching bind and controlUi settings"
-  openclaw config set gateway.bind lan 2>/dev/null || true
-  openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true 2>/dev/null || true
-fi
+
+echo "[start.sh] openclaw.json written (token=${GATEWAY_TOKEN:0:8}..., dangerouslyDisableDeviceAuth=true)"
 
 # ── 1. Check if LiteLLM should be enabled ─────────────────────────────────────
-# Both LITELLM_API_KEY and LITELLM_MODEL must be set to enable the proxy.
-# If either is missing, OpenClaw starts without a pre-configured AI backend
-# and the user can configure providers through OpenClaw's own UI.
 if [ -z "${LITELLM_API_KEY:-}" ] || [ -z "${LITELLM_MODEL:-}" ]; then
     echo "[start.sh] LITELLM_API_KEY or LITELLM_MODEL not set — starting OpenClaw without LiteLLM proxy"
-    echo "[start.sh] You can configure AI providers through OpenClaw's UI after startup"
     exec openclaw gateway --port 7860 --allow-unconfigured
 fi
 
 # ── 2. Write LiteLLM proxy config ─────────────────────────────────────────────
 LITELLM_CONFIG=/tmp/litellm_config.yaml
 
-# The wildcard model_name ("*") catches any model name OpenClaw sends,
-# routing it to the user's configured provider via LiteLLM.
 {
   echo "model_list:"
   echo "  - model_name: \"*\""
