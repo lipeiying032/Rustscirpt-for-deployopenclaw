@@ -4,41 +4,25 @@ set -euo pipefail
 LITELLM_PID=""
 
 # ── 0. Write openclaw.json before gateway starts ──────────────────────────────
-# HF Space runs behind a reverse proxy; all browser connections appear as
-# non-loopback to OpenClaw, triggering device pairing. The three flags below
-# are the documented solution for Docker/proxy deployments (github.com/openclaw/openclaw/issues/29801):
-#   - dangerouslyDisableDeviceAuth:           skip device pairing for Control UI
-#   - allowInsecureAuth:                      allow token-only auth over HTTP
-#   - dangerouslyAllowHostHeaderOriginFallback: trust Host header as origin (no hardcoded allowedOrigins needed)
-#
-# gateway.auth.token is pinned via OPENCLAW_GATEWAY_TOKEN env var (set in HF Secrets),
-# or falls back to a fixed default so token never changes between restarts.
 OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_CONFIG_DIR}/openclaw.json"
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
-# Resolve gateway token: prefer env var (set in HF Space secrets), else use fixed fallback
-GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-openclaw-hf-default-token}"
-
-cat > "$OPENCLAW_CONFIG" << OPENCLAW_JSON
+if [ ! -f "$OPENCLAW_CONFIG" ]; then
+  cat > "$OPENCLAW_CONFIG" << 'OPENCLAW_JSON'
 {
   "gateway": {
-    "mode": "local",
     "bind": "lan",
-    "auth": {
-      "mode": "token",
-      "token": "${GATEWAY_TOKEN}"
-    },
     "controlUi": {
-      "allowInsecureAuth": true,
-      "dangerouslyDisableDeviceAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true
     }
   }
 }
 OPENCLAW_JSON
-
-echo "[start.sh] openclaw.json written (token=${GATEWAY_TOKEN:0:8}..., dangerouslyDisableDeviceAuth=true)"
+  echo "[start.sh] openclaw.json written"
+else
+  echo "[start.sh] openclaw.json already exists, skipping write"
+fi
 
 # ── 1. Check if LiteLLM should be enabled ─────────────────────────────────────
 if [ -z "${LITELLM_API_KEY:-}" ] || [ -z "${LITELLM_MODEL:-}" ]; then
