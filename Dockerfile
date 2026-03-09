@@ -19,14 +19,11 @@ FROM mcr.microsoft.com/playwright:v1.51.0-jammy AS runtime
 USER root
 
 # ── 2a. System deps ────────────────────────────────────────────────────────────
-# NOTE: python3-venv is intentionally omitted.
-# Ubuntu jammy security mirror has removed python3.10-venv (404), which makes
-# dpkg fail at configure time even with --fix-missing. We use pip directly instead.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git tini ca-certificates curl \
         cmake make build-essential \
-        python3 python3-pip \
+        python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # ── 2b. Install Node 22 (OpenClaw requires ≥22; Playwright ships Node 20) ─────
@@ -40,8 +37,11 @@ RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 \
     npm install -g openclaw@latest \
     && rm -rf /tmp/npm-cache
 
-# ── 2d. Install LiteLLM via pip (no venv — jammy's python3.10-venv is broken) ─
-RUN pip3 install --no-cache-dir --break-system-packages "litellm[proxy]"
+# ── 2d. Install LiteLLM into an isolated venv ─────────────────────────────────
+RUN python3 -m venv /opt/litellm-venv \
+    && /opt/litellm-venv/bin/pip install --no-cache-dir "litellm[proxy]"
+
+ENV PATH="/opt/litellm-venv/bin:$PATH"
 
 # ── 2e. Copy Rust sync binary + startup script ────────────────────────────────
 COPY --from=builder /app/target/release/openclaw-hf-sync /usr/local/bin/openclaw-hf-sync
