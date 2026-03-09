@@ -8,21 +8,30 @@ OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_CONFIG_DIR}/openclaw.json"
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
-if [ ! -f "$OPENCLAW_CONFIG" ]; then
-  cat > "$OPENCLAW_CONFIG" << 'OPENCLAW_JSON'
+# Pin the gateway token so it never changes between restarts.
+# Set OPENCLAW_GATEWAY_TOKEN in HF Space Secrets for a custom token.
+# Access the UI via: https://your-space.hf.space/#token=<your-token>
+GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-openclaw-hf-default-token}"
+
+cat > "$OPENCLAW_CONFIG" << OPENCLAW_JSON
 {
   "gateway": {
     "bind": "lan",
+    "auth": {
+      "mode": "token",
+      "token": "${GATEWAY_TOKEN}"
+    },
     "controlUi": {
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true
     }
   }
 }
 OPENCLAW_JSON
-  echo "[start.sh] openclaw.json written"
-else
-  echo "[start.sh] openclaw.json already exists, skipping write"
-fi
+
+echo "[start.sh] openclaw.json written (token=${GATEWAY_TOKEN:0:8}...)"
+echo "[start.sh] Access UI at: https://<your-space>.hf.space/#token=${GATEWAY_TOKEN}"
 
 # ── 1. Check if LiteLLM should be enabled ─────────────────────────────────────
 if [ -z "${LITELLM_API_KEY:-}" ] || [ -z "${LITELLM_MODEL:-}" ]; then
