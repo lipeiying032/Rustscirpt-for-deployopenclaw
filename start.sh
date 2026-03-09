@@ -3,17 +3,16 @@ set -euo pipefail
 
 LITELLM_PID=""
 
-# ── 0. Write openclaw.json before gateway starts ──────────────────────────────
+# ── 0. Write openclaw.json ─────────────────────────────────────────────────────
 OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
-OPENCLAW_CONFIG="${OPENCLAW_CONFIG_DIR}/openclaw.json"
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
-# Pin the gateway token so it never changes between restarts.
-# Set OPENCLAW_GATEWAY_TOKEN in HF Space Secrets for a custom token.
-# Access the UI via: https://your-space.hf.space/#token=<your-token>
 GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-openclaw-hf-default-token}"
 
-cat > "$OPENCLAW_CONFIG" << OPENCLAW_JSON
+# Register LiteLLM proxy as a custom provider directly in openclaw.json.
+# apiKey goes in models.providers (not auth-profiles.json) for custom providers.
+# agents.defaults.model points to litellm/default so OpenClaw stops trying Anthropic.
+cat > "${OPENCLAW_CONFIG_DIR}/openclaw.json" << OPENCLAW_JSON
 {
   "gateway": {
     "bind": "lan",
@@ -26,11 +25,35 @@ cat > "$OPENCLAW_CONFIG" << OPENCLAW_JSON
       "dangerouslyDisableDeviceAuth": true,
       "dangerouslyAllowHostHeaderOriginFallback": true
     }
+  },
+  "models": {
+    "providers": {
+      "litellm": {
+        "baseUrl": "http://127.0.0.1:4000",
+        "apiKey": "litellm-proxy",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "default",
+            "name": "LiteLLM Proxy (${LITELLM_MODEL:-custom})",
+            "contextWindow": 200000,
+            "maxTokens": 8192,
+            "input": ["text", "image"],
+            "reasoning": false
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": "litellm/default"
+    }
   }
 }
 OPENCLAW_JSON
 
-echo "[start.sh] openclaw.json written (token=${GATEWAY_TOKEN:0:8}...)"
+echo "[start.sh] openclaw.json written (provider=litellm, token=${GATEWAY_TOKEN:0:8}...)"
 echo "[start.sh] Access UI at: https://<your-space>.hf.space/#token=${GATEWAY_TOKEN}"
 
 # ── 1. Check if LiteLLM should be enabled ─────────────────────────────────────
@@ -86,8 +109,5 @@ until curl -sf http://127.0.0.1:4000/health/liveliness > /dev/null 2>&1; do
 done
 echo "[start.sh] LiteLLM healthy after ${WAITED}s"
 
-# ── 5. Start OpenClaw pointing at LiteLLM proxy ───────────────────────────────
-exec env \
-    OPENAI_API_KEY=litellm-proxy \
-    OPENAI_BASE_URL=http://127.0.0.1:4000 \
-    openclaw gateway --port 7860 --allow-unconfigured
+# ── 5. Start OpenClaw ─────────────────────────────────────────────────────────
+exec openclaw gateway --port 7860 --allow-unconfigured
