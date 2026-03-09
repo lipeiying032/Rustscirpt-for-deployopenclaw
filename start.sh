@@ -3,6 +3,32 @@ set -euo pipefail
 
 LITELLM_PID=""
 
+# ── 0. Write openclaw.json before gateway starts ──────────────────────────────
+# HF Space domains are dynamically assigned, so we can't hardcode allowedOrigins.
+# dangerouslyAllowHostHeaderOriginFallback lets OpenClaw trust the Host header
+# as the origin — the standard fix for dynamic-domain deployments (Zeabur, HF, etc.)
+OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
+OPENCLAW_CONFIG="${OPENCLAW_CONFIG_DIR}/openclaw.json"
+mkdir -p "$OPENCLAW_CONFIG_DIR"
+
+if [ ! -f "$OPENCLAW_CONFIG" ]; then
+  cat > "$OPENCLAW_CONFIG" << 'OPENCLAW_JSON'
+{
+  "gateway": {
+    "bind": "lan",
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  }
+}
+OPENCLAW_JSON
+  echo "[start.sh] openclaw.json written (dangerouslyAllowHostHeaderOriginFallback=true)"
+else
+  echo "[start.sh] openclaw.json exists — patching bind and controlUi settings"
+  openclaw config set gateway.bind lan 2>/dev/null || true
+  openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true 2>/dev/null || true
+fi
+
 # ── 1. Check if LiteLLM should be enabled ─────────────────────────────────────
 # Both LITELLM_API_KEY and LITELLM_MODEL must be set to enable the proxy.
 # If either is missing, OpenClaw starts without a pre-configured AI backend
@@ -10,15 +36,14 @@ LITELLM_PID=""
 if [ -z "${LITELLM_API_KEY:-}" ] || [ -z "${LITELLM_MODEL:-}" ]; then
     echo "[start.sh] LITELLM_API_KEY or LITELLM_MODEL not set — starting OpenClaw without LiteLLM proxy"
     echo "[start.sh] You can configure AI providers through OpenClaw's UI after startup"
-    exec openclaw gateway --port 7860 --bind lan --allow-unconfigured
+    exec openclaw gateway --port 7860 --allow-unconfigured
 fi
 
 # ── 2. Write LiteLLM proxy config ─────────────────────────────────────────────
 LITELLM_CONFIG=/tmp/litellm_config.yaml
 
-# OpenClaw's internally stored default model name — we register it in LiteLLM
-# so any model name OpenClaw sends will be routed to the user's actual provider.
-# The wildcard entry ("*") catches any other model name OpenClaw might send.
+# The wildcard model_name ("*") catches any model name OpenClaw sends,
+# routing it to the user's configured provider via LiteLLM.
 {
   echo "model_list:"
   echo "  - model_name: \"*\""
@@ -56,7 +81,7 @@ WAITED=0
 until curl -sf http://127.0.0.1:4000/health/liveliness > /dev/null 2>&1; do
     if [ "$WAITED" -ge "$MAX_WAIT" ]; then
         echo "[start.sh] WARNING: LiteLLM not healthy after ${MAX_WAIT}s — starting OpenClaw without proxy"
-        exec openclaw gateway --port 7860 --bind lan --allow-unconfigured
+        exec openclaw gateway --port 7860 --allow-unconfigured
     fi
     sleep 1
     WAITED=$((WAITED + 1))
@@ -67,4 +92,4 @@ echo "[start.sh] LiteLLM healthy after ${WAITED}s"
 exec env \
     OPENAI_API_KEY=litellm-proxy \
     OPENAI_BASE_URL=http://127.0.0.1:4000 \
-    openclaw gateway --port 7860 --bind lan --allow-unconfigured
+    openclaw gateway --port 7860 --allow-unconfigured
