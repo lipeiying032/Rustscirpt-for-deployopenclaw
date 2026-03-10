@@ -69,11 +69,12 @@ LITELLM_CONFIG=/tmp/litellm_config.yaml
   echo "model_list:"
   echo "  - model_name: \"default\""
   echo "    litellm_params:"
-  echo "      model: \"${LITELLM_MODEL}\""
+  # Force openai/ prefix so LiteLLM uses plain OpenAI-compat format.
+  # LITELLM_API_BASE must be set to https://integrate.api.nvidia.com/v1
+  # LITELLM_MODEL should be moonshotai/kimi-k2-instruct-0905 (no nvidia_nim/ prefix)
+  echo "      model: \"openai/${LITELLM_MODEL}\""
   echo "      api_key: \"${LITELLM_API_KEY}\""
-  if [ -n "${LITELLM_API_BASE:-}" ]; then
-    echo "      api_base: \"${LITELLM_API_BASE}\""
-  fi
+  echo "      api_base: \"${LITELLM_API_BASE:-https://integrate.api.nvidia.com/v1}\""
   echo ""
   echo "litellm_settings:"
   echo "  drop_params: true"
